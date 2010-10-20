@@ -126,4 +126,41 @@ class Proxy(Redis):
     def multikey(self, pattern):
         for p in self.keys(pattern):
             yield self[p]
+
+    def prefixed(self, prefix):
+        return Prefixed(self, prefix)
+
+class Prefixed(object):
+    """Decorates a Proxy object, such that any key passed to the underlying
+    proxy automatically has the prefix prepended
+    Note: this only works on proxy calls. it does not alter the underlying
+    behavior of Redis object methods.  For example, the "keys()" method is
+    not prefixed
+
+    Example:
+        p = Proxy()
+        pp = Proxy.prefixed('foo:')
+        pp['bar'] = 1
+        pp.keys('foo:*')
+        -> ['foo:bar']
+    """
+
+    def __init__(self, proxy, prefix):
+        """record the underlying proxy, so we can reuse proxies"""
+        self.proxy = proxy
+        self.prefix = prefix
     
+    __getitem__ = lambda self, key: self.proxy.__getitem__(self.prefix+key)
+    __setitem__ = lambda self, key, value: self.proxy.__setitem__(self.prefix+key, value)
+    __contains__ = lambda self, key: self.proxy.__contains__(self.prefix+key)
+    __delitem = lambda self, key: self.proxy.__delitem__(self.prefix+key)
+    
+    def multikey(self, pattern):
+        for p in self.proxy.keys(pattern):
+            yield self.proxy[self.prefix+p]
+
+    def __getattr__(self, attr):
+        """the prefixed object should behave like the proxy object, so delegate
+        any other attribute accesses to the underlying proxy
+        """
+        return getattr(self.proxy, attr)
