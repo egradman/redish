@@ -14,6 +14,7 @@ server.
 (originally by Adam T. Lindsay)
 """
 from codecs import encode, decode
+import re
 from redis import Redis
 from redish import types
 
@@ -30,6 +31,9 @@ REV_TYPE_MAP = {
     dict:       types.Dict,
     types.ZSet: types.SortedSet,
 }
+
+# OMG, what have I done?
+FORMAT_SPEC = re.compile(r'%(\(\w+\))?[#0\- \+]?[0-9\*]*\.?[0-9\*]*[hlL]?[diouxXeXfXgGcrs]')
 
 def int_or_str(thing, key, client):
     try:
@@ -48,13 +52,32 @@ class Proxy(Redis):
     
     def __init__(self, *args, **kwargs):
         """
+        This mostly defers to the main redis-py object, with the exception of 
+        keeping track of empty elements and keyspaces.
+        
         If a user attempts to initialize a redis key with an empty container, 
         that container is kept in the (local thread's) proxy object so that 
         subsequent accesses keep the right type without throwing KeyErrors.
         """
-        self.empties = {}
+        self._empties = {}
+        self._keyspaces = {}
         super(Proxy, self).__init__(*args, **kwargs)
     
+    def keyspaced(f):
+        def preprocessed(self, key, *argv):
+            if isinstance(key, tuple):
+                keyspace = key[0]
+                if len(key) == 2:
+                    keyargs = key[1:][0]
+                else:
+                    keyargs = tuple(key[1:])
+                key = self._keyspaces[keyspace] % keyargs
+            return f(self, key, *argv)
+        preprocessed.__doc__ = f.__doc__
+        preprocessed.__name__ = f.__name__
+        return preprocessed
+    
+    @keyspaced
     def __getitem__(self, key):
         """Return a proxy type according to the native redis type 
         associated with the key."""
@@ -64,20 +87,21 @@ class Proxy(Redis):
         if typ == 'string':
             # because strings can be empty, check before "empties"
             return int_or_str(self.get(key), key, self)
-        if key in self.empties:
+        if key in self._empties:
             if typ == 'none':
-                return self.empties[key]
+                return self._empties[key]
             else:
-                self.empties.pop(key)
+                self._empties.pop(key)
         if typ == 'none':
             raise KeyError(key)
         else:
             return TYPE_MAP[typ](key, self)
     
+    @keyspaced
     def __setitem__(self, key, value):
         """Copy the contents of the value into the redis store."""
-        if key in self.empties:
-            del self.empties[key]
+        if key in self._empties:
+            del self._empties[key]
         if isinstance(value, (int, types.Int)):
             self.set(key, int(value))
             return
@@ -88,7 +112,7 @@ class Proxy(Redis):
             if self.exists(key):
                 self.delete(key)
             if value != None:
-                self.empties[key] = REV_TYPE_MAP[type(value)](key, self)
+                self._empties[key] = REV_TYPE_MAP[type(value)](key, self)
             return
         pline = self.pipeline()
         if self.exists(key):
@@ -106,64 +130,103 @@ class Proxy(Redis):
                 pline = pline.zadd(key, k, v)
         pline.execute()
     
+    @keyspaced
     def __contains__(self, key):
         """
         We check for existence within the *proxy object*, and so we
         must look in both the backing store and the object's "empties."
         """
-        return self.exists(key) or key in self.empties
+        return self.exists(key) or key in self._empties
     
+    @keyspaced
     def __delitem__(self, k):
         if isinstance(k, Glob):
             keys = self.keys(k)
         else:
             keys = [k]
         for key in keys:
-            if key in self.empties:
-                del self.empties[key]
+            if key in self._empties:
+                del self._empties[key]
         self.delete(*keys)
     
-    def multikey(self, pattern):
-        for p in self.keys(pattern):
-            yield self[p]
-
-    def namespaced(self, formatstring):
-        return Namespaced(self, formatstring)
-
-class Namespaced(object):
-    """Decorates a Proxy object, such that any key passed to the underlying
-    proxy automatically is interpolated into the format string in string context
-    Note: this only works on proxy calls. it does not alter the underlying
-    behavior of Redis object methods.  For example, the "keys()" method is
-    not namespaced
-
-    Example:
-        p = Proxy()
-        pp = Proxy.namespaced('foo:1:%s')
-        pp['bar'] = 1
-        pp.keys('foo:1:*')
-        -> ['foo:1:bar']
-    """
-
-    def __init__(self, proxy, formatstring):
-        """record the underlying proxy, so we can reuse proxies"""
-        self.proxy = proxy
-        self.formatstring = formatstring
-
-    # interpolate key into format string
-    format = lambda self, key: self.formatstring % key
-
-    __getitem__ = lambda self, key: self.proxy.__getitem__(self.format(key))
-    __setitem__ = lambda self, key, value: self.proxy.__setitem__(self.format(key), value)
-    __contains__ = lambda self, key: self.proxy.__contains__(self.format(key))
-    __delitem = lambda self, key: self.proxy.__delitem__(self.format(key))
+    def values(self, pattern):
+        if pattern in self._keyspaces:
+            pattern = FORMAT_SPEC.sub('*', self._keyspaces[pattern])
+        return [self[p] for p in super(Proxy, self).keys(pattern)]
     
-    def multikey(self, pattern):
-        for p in self.proxy.keys(pattern):
-            yield self.proxy[self.format(p)]
-
-    def __getattr__(self, attr):
-        """the prefixed object should behave like the proxy object, so delegate
-        any other attribute accesses to the underlying proxy
+    def keys(self, pattern):
+        if pattern in self._keyspaces:
+            pattern = FORMAT_SPEC.sub('*', self._keyspaces[pattern])
+        return super(Proxy, self).keys(pattern)
+    
+    def items(self, pattern):
+        if pattern in self._keyspaces:
+            pattern = FORMAT_SPEC.sub('*', self._keyspaces[pattern])
+        return [(p, self[p]) for p in super(Proxy, self).keys(pattern)]
+    
+    def register_keyspace(self, shortcut, formatstring):
         """
-        return getattr(self.proxy, attr)
+        Define a keyspace by mapping a label to a formatstring.
+        
+        The function returns the name of the shortcut to facilitate
+        symbolic access with this pattern::
+        
+            VALUE = proxyobject.register_keyspace('val', "user:%d:name")
+        
+        The following three statements are then all equivalent::
+        
+            proxyobject[VALUE, 1001] = "Fred"
+            proxyobject['val', 1001] = "Fred"
+            proxyobject['user:1001:name'] = "Fred"
+        """
+        self._keyspaces[shortcut] = formatstring
+        return shortcut
+    
+    def keyspace(self, keyspace):
+        """
+        Convenient, consistent access to a sub-set of all keys.
+        """
+        if FORMAT_SPEC.search(keyspace):
+            return KeyspacedProxy(self, keyspace)
+        else:
+            return KeyspacedProxy(self, self._keyspaces[keyspace])
+    
+    @keyspaced
+    def actual_key(self, key):
+        """
+        For debugging.
+        """
+        return key
+    
+
+class KeyspacedProxy(Proxy):
+    """
+    The easiest way of describing this is that it simulates a partial on the 
+    mapping object by interpolating the keyspace. Clear?
+    """
+    def __init__(self, proxy, transform):
+        self.proxy = proxy
+        self.transform = transform
+        self.globbed = FORMAT_SPEC.sub('*', transform)
+    
+    def __getitem__(self, key):
+        return self.proxy.__getitem__(self.transform % key)
+    
+    def __setitem__(self, key, value):
+        return self.proxy.__setitem__(self.transform % key, value)
+    
+    def __contains__(self, key):
+        return self.proxy.__contains__(self.transform % key)
+    
+    def __delitem__(self, key):
+        return self.proxy.__delitem__(self.transform % key)
+    
+    def keys(self):
+        return self.proxy.keys(self.globbed)
+    
+    def values(self):
+        return self.proxy.values(self.globbed)
+    
+    def items(self):
+        return self.proxy.items(self.globbed)
+    
