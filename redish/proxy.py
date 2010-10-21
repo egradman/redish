@@ -127,37 +127,40 @@ class Proxy(Redis):
         for p in self.keys(pattern):
             yield self[p]
 
-    def prefixed(self, prefix):
-        return Prefixed(self, prefix)
+    def namespaced(self, formatstring):
+        return Namespaced(self, formatstring)
 
-class Prefixed(object):
+class Namespaced(object):
     """Decorates a Proxy object, such that any key passed to the underlying
-    proxy automatically has the prefix prepended
+    proxy automatically is interpolated into the format string in string context
     Note: this only works on proxy calls. it does not alter the underlying
     behavior of Redis object methods.  For example, the "keys()" method is
-    not prefixed
+    not namespaced
 
     Example:
         p = Proxy()
-        pp = Proxy.prefixed('foo:')
+        pp = Proxy.namespaced('foo:1:%s')
         pp['bar'] = 1
-        pp.keys('foo:*')
-        -> ['foo:bar']
+        pp.keys('foo:1:*')
+        -> ['foo:1:bar']
     """
 
-    def __init__(self, proxy, prefix):
+    def __init__(self, proxy, formatstring):
         """record the underlying proxy, so we can reuse proxies"""
         self.proxy = proxy
-        self.prefix = prefix
-    
-    __getitem__ = lambda self, key: self.proxy.__getitem__(self.prefix+key)
-    __setitem__ = lambda self, key, value: self.proxy.__setitem__(self.prefix+key, value)
-    __contains__ = lambda self, key: self.proxy.__contains__(self.prefix+key)
-    __delitem = lambda self, key: self.proxy.__delitem__(self.prefix+key)
+        self.formatstring = formatstring
+
+    # interpolate key into format string
+    format = lambda self, key: self.formatstring % key
+
+    __getitem__ = lambda self, key: self.proxy.__getitem__(self.format(key))
+    __setitem__ = lambda self, key, value: self.proxy.__setitem__(self.format(key), value)
+    __contains__ = lambda self, key: self.proxy.__contains__(self.format(key))
+    __delitem = lambda self, key: self.proxy.__delitem__(self.format(key))
     
     def multikey(self, pattern):
         for p in self.proxy.keys(pattern):
-            yield self.proxy[self.prefix+p]
+            yield self.proxy[self.format(p)]
 
     def __getattr__(self, attr):
         """the prefixed object should behave like the proxy object, so delegate
